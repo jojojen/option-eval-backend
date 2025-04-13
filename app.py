@@ -5,8 +5,10 @@ import numpy as np
 from datetime import datetime, timedelta
 import math
 import logging
+from flask_cors import CORS
 
 app = Flask(__name__)
+CORS(app)
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
