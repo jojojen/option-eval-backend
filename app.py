@@ -57,23 +57,42 @@ def get_risk_free_rate():
 def get_filtered_options(ticker, min_days=5, min_volume=10, min_open_interest=10, max_theoretical_price=2.0):
     logger.info(f"Fetching options data for {ticker}")
     stock = yf.Ticker(ticker)
-    S = stock.history(period='1d')['Close'].iloc[-1]
-    logger.info(f"Current stock price (S): {S}")
+    try:
+        S = stock.history(period='1d')['Close'].iloc[-1]
+        logger.info(f"Current stock price (S): {S}")
+    except IndexError:
+        logger.error("Failed to fetch stock price")
+        return pd.DataFrame(), pd.DataFrame(), 0.0, 0.0, 0.0
+    
     expiration_dates = stock.options
     today = datetime.now()
     min_expiration = today + timedelta(days=min_days * 7 / 5)
     valid_dates = [date for date in expiration_dates if datetime.strptime(date, '%Y-%m-%d') >= min_expiration]
     logger.info(f"Valid expiration dates: {valid_dates}")
+    
+    if not valid_dates:
+        logger.warning("No valid expiration dates found")
+        return pd.DataFrame(), pd.DataFrame(), S, 0.0, 0.0
+    
     calls_list = []
     puts_list = []
     for date in valid_dates:
-        chain = stock.option_chain(date)
-        calls = chain.calls
-        puts = chain.puts
-        calls['expiration'] = date
-        puts['expiration'] = date
-        calls_list.append(calls)
-        puts_list.append(puts)
+        try:
+            chain = stock.option_chain(date)
+            calls = chain.calls
+            puts = chain.puts
+            calls['expiration'] = date
+            puts['expiration'] = date
+            calls_list.append(calls)
+            puts_list.append(puts)
+        except Exception as e:
+            logger.warning(f"Failed to fetch option chain for {date}: {str(e)}")
+            continue
+    
+    if not calls_list or not puts_list:
+        logger.warning("No option chains retrieved")
+        return pd.DataFrame(), pd.DataFrame(), S, 0.0, 0.0
+    
     all_calls = pd.concat(calls_list, ignore_index=True)
     all_puts = pd.concat(puts_list, ignore_index=True)
     # Filter by liquidity
@@ -81,13 +100,23 @@ def get_filtered_options(ticker, min_days=5, min_volume=10, min_open_interest=10
     all_puts = all_puts[(all_puts['volume'] > min_volume) & (all_puts['openInterest'] > min_open_interest)]
     # Calculate theoretical price
     r = get_risk_free_rate()
-    sigma_daily = get_historical_volatility(ticker)
-    sigma_annual = sigma_daily * math.sqrt(252)
-    logger.info(f"Annualized volatility (sigma_annual): {sigma_annual}")
-    all_calls['theoretical_price'] = all_calls.apply(
-        lambda row: black_scholes(S, row['strike'], (datetime.strptime(row['expiration'], '%Y-%m-%d') - today).days / 365, r, sigma_annual, 'call'), axis=1)
-    all_puts['theoretical_price'] = all_puts.apply(
-        lambda row: black_scholes(S, row['strike'], (datetime.strptime(row['expiration'], '%Y-%m-%d') - today).days / 365, r, sigma_annual, 'put'), axis=1)
+    try:
+        sigma_daily = get_historical_volatility(ticker)
+        sigma_annual = sigma_daily * math.sqrt(252)
+        logger.info(f"Annualized volatility (sigma_annual): {sigma_annual}")
+    except Exception as e:
+        logger.error(f"Failed to calculate volatility: {str(e)}")
+        return pd.DataFrame(), pd.DataFrame(), S, r, 0.0
+    
+    try:
+        all_calls['theoretical_price'] = all_calls.apply(
+            lambda row: black_scholes(S, row['strike'], (datetime.strptime(row['expiration'], '%Y-%m-%d') - today).days / 365, r, sigma_annual, 'call'), axis=1)
+        all_puts['theoretical_price'] = all_puts.apply(
+            lambda row: black_scholes(S, row['strike'], (datetime.strptime(row['expiration'], '%Y-%m-%d') - today).days / 365, r, sigma_annual, 'put'), axis=1)
+    except Exception as e:
+        logger.error(f"Error calculating theoretical prices: {str(e)}")
+        return pd.DataFrame(), pd.DataFrame(), S, r, sigma_annual
+    
     # Filter by theoretical price
     filtered_calls = all_calls[all_calls['theoretical_price'] <= max_theoretical_price]
     filtered_puts = all_puts[all_puts['theoretical_price'] <= max_theoretical_price]
@@ -97,19 +126,43 @@ def get_filtered_options(ticker, min_days=5, min_volume=10, min_open_interest=10
 def select_otm_options(calls, puts, S):
     otm_calls = calls[calls['strike'] > S]
     otm_puts = puts[puts['strike'] < S]
-    call_selected = otm_calls.iloc[(otm_calls['strike'] - S).abs().argmin()] if not otm_calls.empty else None
-    put_selected = otm_puts.iloc[(S - otm_puts['strike']).abs().argmin()] if not otm_puts.empty else None
+    call_selected = None
+    put_selected = None
+    if not otm_calls.empty:
+        try:
+            call_selected = otm_calls.iloc[(otm_calls['strike'] - S).abs().argmin()]
+        except Exception as e:
+            logger.warning(f"Error selecting OTM call: {str(e)}")
+    if not otm_puts.empty:
+        try:
+            put_selected = otm_puts.iloc[(S - otm_puts['strike']).abs().argmin()]
+        except Exception as e:
+            logger.warning(f"Error selecting OTM put: {str(e)}")
     return call_selected, put_selected
 
 # Main function: Get option recommendation
 def get_option_recommendation(ticker, min_days=5, min_volume=10, min_open_interest=10, max_theoretical_price=2.0):
     calls, puts, S, r, sigma_annual = get_filtered_options(ticker, min_days, min_volume, min_open_interest, max_theoretical_price)
+    
+    if calls.empty and puts.empty:
+        logger.warning(f"No options found for {ticker} with given filters")
+        return {
+            'call': None,
+            'put': None,
+            'cal_summary': {
+                'risk_free_rate': r,
+                'annualized_volatility': sigma_annual,
+                'stock_price': S
+            },
+            'message': 'No qualifying options found'
+        }
+    
     call_selected, put_selected = select_otm_options(calls, puts, S)
     
     # Handle call option
     if call_selected is not None:
         exp_date = datetime.strptime(call_selected['expiration'], '%Y-%m-%d').strftime('%m/%d/%y')
-        call_desc = f"{exp_date} {call_selected['strike']:.2f} Call"
+        call_desc = f"{ticker} {exp_date} {call_selected['strike']:.2f} Call"
         call_result = {
             'ask': call_selected['ask'],
             'bid': call_selected['bid'],
@@ -126,7 +179,7 @@ def get_option_recommendation(ticker, min_days=5, min_volume=10, min_open_intere
     # Handle put option
     if put_selected is not None:
         exp_date = datetime.strptime(put_selected['expiration'], '%Y-%m-%d').strftime('%m/%d/%y')
-        put_desc = f"{exp_date} {put_selected['strike']:.2f} Put"
+        put_desc = f"{ticker} {exp_date} {put_selected['strike']:.2f} Put"
         put_result = {
             'ask': put_selected['ask'],
             'bid': put_selected['bid'],
@@ -157,16 +210,20 @@ def get_option_recommendation(ticker, min_days=5, min_volume=10, min_open_intere
 # Flask route
 @app.route('/api/options', methods=['POST'])
 def get_options():
-    data = request.json
-    if not data or 'ticker' not in data:
-        return jsonify({'error': 'Ticker is required'}), 400
-    ticker = data['ticker']
-    min_days = data.get('min_days', 5)
-    min_volume = data.get('min_volume', 10)
-    min_open_interest = data.get('min_open_interest', 10)
-    max_theoretical_price = data.get('max_theoretical_price', 2.0)
-    result = get_option_recommendation(ticker, min_days, min_volume, min_open_interest, max_theoretical_price)
-    return jsonify(result)
+    try:
+        data = request.json
+        if not data or 'ticker' not in data:
+            return jsonify({'error': 'Ticker is required'}), 400
+        ticker = data['ticker']
+        min_days = data.get('min_days', 5)
+        min_volume = data.get('min_volume', 10)
+        min_open_interest = data.get('min_open_interest', 10)
+        max_theoretical_price = data.get('max_theoretical_price', 2.0)
+        result = get_option_recommendation(ticker, min_days, min_volume, min_open_interest, max_theoretical_price)
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"Error processing /api/options: {str(e)}")
+        return jsonify({'error': f'Internal server error: {str(e)}'}), 500
 
 if __name__ == '__main__':
     app.run(debug=True, port=5000)

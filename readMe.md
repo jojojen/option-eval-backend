@@ -5,3 +5,4 @@ conda deactivate
 conda activate
 python get-pip.py
 pip --version
+python app.py
